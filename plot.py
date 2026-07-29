@@ -2,371 +2,440 @@ import glob
 import os
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 import numpy as np
+from datetime import datetime
 from settings import MAP
 
-#load latest log file
-files = glob.glob("logs/run_log_*.csv")
-if not files:
-    raise RuntimeError("NO LOG PAPI")
-latest_file = max(files, key=os.path.getmtime)
-print(f"Loading data from: {latest_file}")
-df = pd.read_csv(latest_file)
-
-ep=df.groupby("episode").agg(mean_lu=('local_uncertainty','mean'),
-                             mean_fi=('frontier_ignorance','mean'),
-                             mean_gc=('ghost_certainty','mean'),
-                             mean_te=('tiles_explored','mean'),
-                             mean_nt=('new_tiles','mean'),
-                             mean_pe=('mean_prediction_error','mean'))
-
-# Diagnostic calculations[Revisist Rate, New Tiles per Steps, Seen Tiles out of Total]
-df["is_idle"] = df["action"] == "idle"
-df["visited_before"] = df.duplicated(subset=["episode", "x", "y"])
-revisit_rate = df.groupby("episode")["visited_before"].mean()
-revisit_idle = df[df["is_idle"]].groupby("episode")["visited_before"].mean()
-revisit_move = df[~df["is_idle"]].groupby("episode")["visited_before"].mean()
-print("\\\DIAGNOSTIC//")
-print("Revisit rate per episode:", revisit_rate.tail(10))
-print("Revisit rate when idle per episode:", revisit_idle.tail(10))
-print("Revisit rate when moving per episode:", revisit_move.tail(10))
-
-new_tiles_per_1000 = df["new_tiles"].sum() / (len(df) / 1000)
-print("New tiles per 1000 steps(global):", new_tiles_per_1000)
-
-WINDOW = 1000
-df["new_tiles_window"]=df["new_tiles"].rolling(window=WINDOW, min_periods=WINDOW).sum()
-new_tiles_window = df["new_tiles_window"]
-print(f"New tiles per {WINDOW} steps (rolling):", new_tiles_window.tail(10))
-
+# -------------------------------------------------------
+# Config
+# -------------------------------------------------------
+CONDITIONS = ["decay_on", "decay_off", "c1_random", "c5_pure_pe"]
+CONDITION_COLORS = {
+    "decay_on":   "#1f77b4",  # blue
+    "decay_off":  "#ff7f0e",  # orange
+    "c1_random":  "#2ca02c",  # green
+    "c5_pure_pe": "#d62728",  # red
+}
+SEEDS = ["1", "2", "3"]
 H = len(MAP)
 W = len(MAP[0])
-sum = df.iloc[-1]
 total_tiles = H * W
-seen_tiles = int(sum["tiles_explored"]*total_tiles)
+ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+WINDOW = 1000
+ROLL_W = 200
+pe_col = "mean_prediction_error"
 
-print(f"There were {seen_tiles} tiles out of {total_tiles} explored in the last episode.")
-print("-----------------------------------")
-#Idleness through time
-window = 500
-df["idle_roll"]=df["is_idle"].rolling(window, min_periods=window).mean()
-df["lu_roll"]=df["local_uncertainty"].rolling(window, min_periods=window).mean()
-df["fi_roll"]=df["frontier_ignorance"].rolling(window, min_periods=window).mean()
-df["pe_roll"]=df["mean_prediction_error"].rolling(window,min_periods=window).mean()
+# -------------------------------------------------------
+# Load all logs
+# -------------------------------------------------------
+condition_files = {c: sorted(glob.glob(f"logs/run_log_{c}_seed*.csv")) for c in CONDITIONS}
+all_files = [f for files in condition_files.values() for f in files]
+if not all_files:
+    raise RuntimeError("NO LOG FILES FOUND. Run conditions.py first.")
 
-# Conditional idle probability
-df["local_uncertainty"] = pd.to_numeric(df["local_uncertainty"], errors="coerce")
-df["frontier_ignorance"] = pd.to_numeric(df["frontier_ignorance"], errors="coerce")
-df["mean_prediction_error"] = pd.to_numeric(df["mean_prediction_error"], errors="coerce")
-df["is_idle"] = (df["action"] == "idle")
+dfs = {}
+for condition, files in condition_files.items():
+    for f in files:
+        try:
+            seed = f.split("seed")[1].split("_")[0]
+        except IndexError:
+            seed = "?"
+        label = f"{condition}_s{seed}"
+        dfs[label] = pd.read_csv(f)
+        dfs[label]["condition"] = condition
+        dfs[label]["seed"] = seed
 
-# Drop rows where LU/FI missing (shouldn't happen often, but makes masks safe)
-df2 = df.dropna(subset=["local_uncertainty", "frontier_ignorance","mean_prediction_error"]).copy()
+print(f"Loaded {len(dfs)} log files: {list(dfs.keys())}")
 
-lu_thresh = df2["local_uncertainty"].quantile(0.10)
-fi_thresh = df2["frontier_ignorance"].quantile(0.10)
-pe_thresh = df2["mean_prediction_error"].quantile(0.10)
-
-low_mask = ((df2["local_uncertainty"] <= lu_thresh) & (df2["frontier_ignorance"] <= fi_thresh) & (df2["mean_prediction_error"]<=pe_thresh)).to_numpy()
-
-p_idle_low = df2["is_idle"].to_numpy()[low_mask].mean() if low_mask.any() else float("nan")
-p_idle_high = df2["is_idle"].to_numpy()[~low_mask].mean() if (~low_mask).any() else float("nan")
-
-print("Idle vs Epistemic State")
-print("LU threshold (10%):", lu_thresh)
-print("FI threshold (10%):", fi_thresh)
-print("MPE treshold (10%);", pe_thresh)
-print("P(idle | low LU & low FI):", p_idle_low)
-print("P(idle | otherwise):      ", p_idle_high)
-
-# Periods of Idleness
-df["new_tiles_1000"] = df["new_tiles"].rolling(WINDOW, min_periods=WINDOW).sum()
-df["lu_roll"] = df["local_uncertainty"].rolling(WINDOW, min_periods=WINDOW).mean()
-df["fi_roll"] = df["frontier_ignorance"].rolling(WINDOW, min_periods=WINDOW).mean()
-df["pe_roll"] = df["mean_prediction_error"].rolling(WINDOW, min_periods=WINDOW).mean()
-
-# Less brittle thresholds: use 25% instead of 10% to avoid near-zero collapse
-lu_thresh_idle = df["local_uncertainty"].quantile(0.25)
-fi_thresh_idle = df["frontier_ignorance"].quantile(0.25)
-pe_thresh_idle = df["mean_prediction_error"].quantile(0.25)
-
-df["epistemic_idleness"] = (
-    (df["new_tiles_1000"] <= 0) &
-    (df["lu_roll"] <= lu_thresh_idle) &
-    (df["fi_roll"] <= fi_thresh_idle) &
-    (df["pe_roll"] <= pe_thresh_idle)
-)
-
-# contiguous blocks
-df["idle_block2"] = (df["epistemic_idleness"] != df["epistemic_idleness"].shift()).cumsum()
-
-idle_segments = (
-    df[df["epistemic_idleness"]]
-    .groupby("idle_block2")
-    .agg(
-        episode=("episode", "min"),
-        start_step=("step_in_episode", "min"),
-        end_step=("step_in_episode", "max"),
-        duration_steps=("epistemic_idleness", "size"),
-        mean_pe=("mean_prediction_error", "mean"),
+# -------------------------------------------------------
+# Helper: aggregate per episode
+# -------------------------------------------------------
+def agg_episodes(df):
+    return df.groupby("episode").agg(
         mean_lu=("local_uncertainty", "mean"),
         mean_fi=("frontier_ignorance", "mean"),
-        new_tiles_sum=("new_tiles", "sum"),
-        idle_frac=("is_idle", "mean"),
+        mean_gc=("ghost_certainty", "mean"),
+        mean_te=("tiles_explored", "mean"),
+        mean_nt=("new_tiles", "mean"),
+        mean_pe=(pe_col, "mean"),
     )
-    .sort_values("duration_steps", ascending=False)
-)
 
-print("Longest Idleness Segments:", idle_segments.head(5))
+# -------------------------------------------------------
+# Helper: extract condition from label safely
+# -------------------------------------------------------
+def get_condition(label):
+    for c in CONDITIONS:
+        if label.startswith(c + "_s"):
+            return c
+    return "unknown"
 
-q = df[df["epistemic_idleness"]].copy()
-action_dist_q = q["action"].value_counts(normalize=True)
+# -------------------------------------------------------
+# Legend handles (shared across all figures)
+# -------------------------------------------------------
+legend_handles = [
+    mlines.Line2D([], [], color=CONDITION_COLORS[c], linewidth=2.5, label=c)
+    for c in CONDITIONS
+]
 
-nq = df[~df["epistemic_idleness"]].copy()
-action_dist_nq = nq["action"].value_counts(normalize=True)
+# -------------------------------------------------------
+# DIAGNOSTICS
+# -------------------------------------------------------
+print("\n========== DIAGNOSTICS ==========")
+for condition in CONDITIONS:
+    cdfs = {k: v for k, v in dfs.items() if get_condition(k) == condition}
+    if not cdfs:
+        print(f"\n[{condition}] No data found.")
+        continue
+    print(f"\n--- {condition} ---")
+    for label, df in cdfs.items():
+        df["is_idle"] = df["action"] == "idle"
+        df["visited_before"] = df.duplicated(subset=["episode", "x", "y"])
+        revisit_rate = df.groupby("episode")["visited_before"].mean()
+        new_tiles_per_1000 = df["new_tiles"].sum() / (len(df) / 1000)
+        seen_tiles = int(df.iloc[-1]["tiles_explored"] * total_tiles)
+        print(f"  [{label}] Revisit rate (last 5 ep): {revisit_rate.tail(5).values.round(3)}")
+        print(f"  [{label}] New tiles per 1000 steps: {new_tiles_per_1000:.2f}")
+        print(f"  [{label}] Tiles explored (last step): {seen_tiles}/{total_tiles}")
 
-print("\nAction distribution DURING epistemic idleness:")
-print(action_dist_q)
-print("\nAction distribution OUTSIDE epistemic idleness:")
-print(action_dist_nq)
-print("-----------------------------------")
+# -------------------------------------------------------
+# FIGURE SET 1: Epistemic metrics — one figure per seed
+# -------------------------------------------------------
+metric_config = {
+    "mean_lu": ("Mean Local Uncertainty", "LU"),
+    "mean_fi": ("Mean Frontier Ignorance", "FI"),
+    "mean_pe": ("Mean Prediction Error", "PE"),
+    "mean_gc": ("Mean Ghost Certainty", "GC"),
+    "mean_te": ("Mean Tiles Explored", "Coverage"),
+    "mean_nt": ("Mean New Tiles per Step", "New Tiles"),
+}
 
-ts = os.path.basename(latest_file).replace("run_log_", "").replace(".csv", "")
+for seed in SEEDS:
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig.suptitle(f"CuriousMan — Epistemic Metrics (Seed {seed})",
+                 fontsize=14, fontweight="bold")
 
-print(df.head())
+    ax_map = {
+        "mean_lu": axes[0, 0], "mean_fi": axes[0, 1], "mean_pe": axes[0, 2],
+        "mean_gc": axes[1, 0], "mean_te": axes[1, 1], "mean_nt": axes[1, 2],
+    }
 
-# --- Plot 1: Local uncertainty over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_lu"])
-plt.xlabel("Episode")
-plt.ylabel("Mean Local Uncertainty")
-plt.title("Mean Local Uncertainty Over Episodes")
-plt.savefig(f"logs/mean_local_uncertainty_{ts}.png")
-plt.close()
+    seed_labels = {label: df for label, df in dfs.items()
+                   if label.endswith(f"_s{seed}")}
 
-# --- Plot 2: Frontier ignorance over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_fi"])
-plt.xlabel("Episode")
-plt.ylabel("Mean Frontier Ignorance")
-plt.title("Mean Frontier Ignorance Over Episodes")
-plt.savefig(f"logs/mean_frontier_ignorance_{ts}.png")
-plt.close()
+    for label, df in seed_labels.items():
+        condition = get_condition(label)
+        color = CONDITION_COLORS.get(condition, "gray")
+        ep = agg_episodes(df)
 
+        for metric, (title, ylabel) in metric_config.items():
+            ax = ax_map[metric]
+            ax.plot(ep.index, ep[metric], color=color, linewidth=2,
+                    label=condition)
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Episode")
+            ax.set_ylabel(ylabel)
 
-# --- Plot 3: Action distribution ---
-plt.figure()
-df["action"].value_counts().plot(kind="bar")
-plt.xlabel("Action")
-plt.ylabel("Count")
-plt.title("Action Distribution")
-plt.savefig(f"logs/action_distribution_{ts}.png")
-plt.close()
+    fig.legend(handles=legend_handles, loc="lower center", ncol=4,
+               fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    plt.tight_layout(rect=[0, 0.04, 1, 1])
+    fname = f"logs/panel_epistemic_seed{seed}_{ts}.png"
+    fig.savefig(fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {fname}")
 
-# --- Plot 5: Ghost certainty over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_gc"])
-plt.xlabel("Episode")
-plt.ylabel("Mean Ghost Certainty")
-plt.title("Mean Ghost Certainty Over Episodes")
-plt.savefig(f"logs/mean_ghost_certainty_{ts}.png")
-plt.close()
+# -------------------------------------------------------
+# FIGURE SET 2: Behaviour & PE Variance — one figure per seed
+# -------------------------------------------------------
+for seed in SEEDS:
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    fig.suptitle(f"CuriousMan — Behaviour & PE Variance (Seed {seed})",
+                 fontsize=14, fontweight="bold")
 
-# --- Plot 6: Tiles explored over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_te"])
-plt.xlabel("Episode")
-plt.ylabel("Mean Tiles Explored")
-plt.title("Mean Tiles Explored Over Episodes")
-plt.savefig(f"logs/mean_tiles_explored_{ts}.png")
-plt.close()
+    seed_labels = {label: df for label, df in dfs.items()
+                   if label.endswith(f"_s{seed}")}
 
-#--- Plot 7: New tiles discovered over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_nt"])
-plt.xlabel("Episode")
-plt.ylabel("Mean New Tiles Discovered")
-plt.title("Mean New Tiles Discovered Over Episodes")
-plt.savefig(f"logs/mean_new_tiles_{ts}.png")
-plt.close()
+    # --- Panel 1: Action distribution ---
+    ax_act = axes[0]
+    action_counts = {}
+    for label, df in seed_labels.items():
+        condition = get_condition(label)
+        action_counts[condition] = df["action"].value_counts(normalize=True)
 
-#---Plot 8: Mean Prediction Error over time ---
-plt.figure()
-plt.plot(ep.index, ep["mean_pe"])
-plt.xlabel("Episode")
-plt.ylabel("Mean Prediction Error")
-plt.title("Mean Prediction Error over Episodes")
-plt.savefig(f"logs/mean_prediction_error_{ts}.png")
-plt.close
+    actions = ["left", "right", "up", "down", "idle"]
+    x = np.arange(len(actions))
+    width = 0.2
+    for i, condition in enumerate(CONDITIONS):
+        if condition not in action_counts:
+            continue
+        vals = [action_counts[condition].get(a, 0) for a in actions]
+        ax_act.bar(x + i * width, vals, width, label=condition,
+                   color=CONDITION_COLORS[condition], alpha=0.85)
+    ax_act.set_xticks(x + width * 1.5)
+    ax_act.set_xticklabels(actions, fontsize=9)
+    ax_act.set_title(f"Action Distribution (Seed {seed})")
+    ax_act.set_ylabel("Proportion")
+    ax_act.legend(fontsize=8)
 
-print("Plots saved to logs/ with timestamp:", ts)
+    # --- Panel 2: PE Variance move vs idle ---
+    ax_pev = axes[1]
+    box_data_move, box_data_idle, box_labels = [], [], []
 
+    for condition in CONDITIONS:
+        label = f"{condition}_s{seed}"
+        if label not in seed_labels:
+            continue
+        df = seed_labels[label].dropna(subset=[pe_col]).copy()
+        df["is_move"] = df["action"] != "idle"
+        box_data_move.append(df.loc[df["is_move"], pe_col].values)
+        box_data_idle.append(df.loc[~df["is_move"], pe_col].values)
+        box_labels.append(condition.replace("_", "\n"))
 
-# ------------- CORRELATION ------------------
+    positions_move = np.arange(1, len(box_labels) * 3, 3)
+    positions_idle = positions_move + 1
 
-needed = ["mean_prediction_error", "local_uncertainty", "frontier_ignorance", "episode", "action"]
-missing = [c for c in needed if c not in df.columns]
-if missing:
-    raise KeyError(f"Missing columns in CSV: {missing}")
+    ax_pev.boxplot(box_data_move, positions=positions_move, widths=0.7,
+                   showfliers=False, patch_artist=True,
+                   boxprops=dict(facecolor="#aec7e8", alpha=0.8))
+    ax_pev.boxplot(box_data_idle, positions=positions_idle, widths=0.7,
+                   showfliers=False, patch_artist=True,
+                   boxprops=dict(facecolor="#ffbb78", alpha=0.8))
+    ax_pev.set_xticks(positions_move + 0.5)
+    ax_pev.set_xticklabels(box_labels, fontsize=8)
+    ax_pev.set_title(f"PE Distribution: Move vs Idle (Seed {seed})")
+    ax_pev.set_ylabel("Mean Prediction Error")
+    move_patch = mlines.Line2D([], [], color="#aec7e8", linewidth=6, label="move")
+    idle_patch = mlines.Line2D([], [], color="#ffbb78", linewidth=6, label="idle")
+    ax_pev.legend(handles=[move_patch, idle_patch], fontsize=8)
 
-df["mean_prediction_error"]= pd.to_numeric(df["mean_prediction_error"], errors="coerce")
-df["local_uncertainty"]=pd.to_numeric(df["local_uncertainty"], errors="coerce")
-df["frontier_ignorance"]=pd.to_numeric(df["frontier_ignorance"], errors="coerce")
+    # --- Panel 3: Rolling PE variance ---
+    ax_roll = axes[2]
+    for label, df in seed_labels.items():
+        condition = get_condition(label)
+        color = CONDITION_COLORS.get(condition, "gray")
+        df = df.dropna(subset=[pe_col]).copy()
+        df["pe_var_roll"] = df[pe_col].rolling(ROLL_W, min_periods=ROLL_W).var()
+        ax_roll.plot(df.index, df["pe_var_roll"], color=color,
+                     linewidth=1.5, alpha=0.85, label=condition)
+    ax_roll.set_title(f"Rolling PE Variance (window={ROLL_W}, Seed {seed})")
+    ax_roll.set_xlabel("Step")
+    ax_roll.set_ylabel("Var(PE)")
+    ax_roll.legend(handles=legend_handles, fontsize=8)
 
-#behaviour
-df["is_idle"]=(df["action"]=="idle")
-df["is_move"]=(~df["is_idle"]).astype(int)
+    plt.tight_layout()
+    fname = f"logs/panel_behaviour_seed{seed}_{ts}.png"
+    fig.savefig(fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {fname}")
 
-df2 = df.dropna(subset=["mean_prediction_error", "local_uncertainty", "frontier_ignorance"]).copy()
+# -------------------------------------------------------
+# SPEARMAN CORRELATIONS (per condition)
+# -------------------------------------------------------
+print("\n========== SPEARMAN CORRELATIONS ==========")
 
-drop_all_zero= True
-if drop_all_zero:
-    mask_zero= (
-        (df2["mean_prediction_error"]==0) &
-        (df2["local_uncertainty"]==0) &
-        (df2["frontier_ignorance"]==0)
+def spearman_pair(g, a, b):
+    if len(g) < 10:
+        return np.nan
+    if g[a].nunique() < 2 or g[b].nunique() < 2:
+        return np.nan
+    return g[[a, b]].corr(method="spearman").iloc[0, 1]
+
+corr_cols = ["mean_prediction_error", "local_uncertainty", "frontier_ignorance", "is_move"]
+
+for condition in CONDITIONS:
+    cdfs = [df for k, df in dfs.items() if get_condition(k) == condition]
+    if not cdfs:
+        continue
+    combined = pd.concat(cdfs).copy()
+    for col in ["mean_prediction_error", "local_uncertainty", "frontier_ignorance"]:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    combined["is_idle"] = combined["action"] == "idle"
+    combined["is_move"] = (~combined["is_idle"]).astype(int)
+
+    df2 = combined.dropna(subset=["mean_prediction_error", "local_uncertainty",
+                                   "frontier_ignorance"]).copy()
+    mask_zero = (
+        (df2["mean_prediction_error"] == 0) &
+        (df2["local_uncertainty"] == 0) &
+        (df2["frontier_ignorance"] == 0)
     )
     df2 = df2.loc[~mask_zero].copy()
 
-print("------------ SPEARMAN CORRELATION (GLOBAL) --------------")
+    print(f"\n--- {condition} (global Spearman) ---")
+    global_corr = df2[corr_cols].corr(method="spearman")
+    print(global_corr.round(3))
+    global_corr.to_csv(f"logs/global_spearman_{condition}_{ts}.csv")
 
-corr_cols = ["mean_prediction_error", "local_uncertainty", "frontier_ignorance", "is_move"]
-global_corr= df2[corr_cols].corr(method="spearman")
-global_corr.to_csv(f"logs/global_spearman_{ts}.csv")
-print(global_corr)
+    rows = []
+    for ep_n, g in df2.groupby("episode"):
+        rows.append({
+            "episode": ep_n,
+            "rho_PE_LU":   spearman_pair(g, "mean_prediction_error", "local_uncertainty"),
+            "rho_PE_FI":   spearman_pair(g, "mean_prediction_error", "frontier_ignorance"),
+            "rho_LU_FI":   spearman_pair(g, "local_uncertainty", "frontier_ignorance"),
+            "rho_PE_move": spearman_pair(g, "mean_prediction_error", "is_move"),
+            "rho_LU_move": spearman_pair(g, "local_uncertainty", "is_move"),
+            "rho_FI_move": spearman_pair(g, "frontier_ignorance", "is_move"),
+            "n_steps": len(g),
+        })
+    per_ep = pd.DataFrame(rows).sort_values("episode")
+    per_ep.to_csv(f"logs/per_episode_spearman_{condition}_{ts}.csv", index=False)
 
-print("------------ SPEARMAN CORRELATION (PER EPISODE) --------------")
-def spearman_pair(g, a, b): #g is a dataframe
-    if len(g)<10:
-        return np.nan
-    if g[a].nunique()<2 or g[b].nunique()<2:
-        return np.nan
-    return g[[a,b]].corr(method="spearman").iloc[0,1]
+    max_ep = int(df2["episode"].max())
+    cut1 = max(1, max_ep // 3)
+    cut2 = max(2, 2 * max_ep // 3)
+    df2["phase"] = df2["episode"].apply(
+        lambda e: "early" if e <= cut1 else ("mid" if e <= cut2 else "late")
+    )
+    print(f"  Phase correlations:")
+    for ph, g in df2.groupby("phase"):
+        pc = g[corr_cols].corr(method="spearman")
+        print(f"    [{ph}] PE↔LU={pc.loc['mean_prediction_error','local_uncertainty']:.3f}  "
+              f"PE↔FI={pc.loc['mean_prediction_error','frontier_ignorance']:.3f}  "
+              f"PE↔move={pc.loc['mean_prediction_error','is_move']:.3f}")
 
-rows=[]
-for ep, g in df2.groupby("episode"):
-    rows.append({
-        "episode":ep,
-        "rho_PE_LU": spearman_pair(g,"mean_prediction_error","local_uncertainty"),
-        "rho_PE_FI": spearman_pair(g,"mean_prediction_error","frontier_ignorance"),
-        "rho_LU_FI": spearman_pair(g, "local_uncertainty", "frontier_ignorance"),
-        "rho_PE_move": spearman_pair(g,"mean_prediction_error", "is_move"),
-        "rho_LU_move": spearman_pair(g,"local_uncertainty", "is_move"),
-        "rho_FI_move": spearman_pair(g, "frontier_ignorance", "is_move"),
-        "n_steps":len(g)
-    })
+# -------------------------------------------------------
+# PE VARIANCE: Move vs Idle
+# -------------------------------------------------------
+print("\n========== PE VARIANCE: MOVE vs IDLE ==========")
+for condition in CONDITIONS:
+    cdfs = [df for k, df in dfs.items() if get_condition(k) == condition]
+    if not cdfs:
+        continue
+    combined = pd.concat(cdfs).dropna(subset=[pe_col]).copy()
+    combined["is_move"] = combined["action"] != "idle"
+    stats = (
+        combined.groupby("is_move")[pe_col]
+        .agg(n="size", mean="mean", var="var", std="std", median="median")
+    )
+    stats.index = stats.index.map({True: "move", False: "idle"})
+    print(f"\n--- {condition} ---")
+    print(stats.round(8))
+    stats.to_csv(f"logs/pe_variance_global_{condition}_{ts}.csv")
 
-per_ep_corr= pd.DataFrame(rows).sort_values("episode")
-print(per_ep_corr.tail(15))
-
-per_ep_corr.to_csv(f"logs/per_episode_spearman_correlations{ts}.csv", index=False)
-print("\nSaved: per_episode_spearman_correlations.csv")
-
-print("------------ SPEARMAN CORRELATION (PHASES) --------------")
-
-max_ep = int(df2["episode"].max())
-cut1 = max(1, max_ep//3)
-cut2= max(2, 2*max_ep//3)
-
-def phase_label(ep):
-    if ep <= cut1:
-        return "early"
-    elif ep <= cut2:
-        return "mid"
-    else:
-        return "late"
-df2["phase"]=df2["episode"].apply(phase_label)
-
-phase_rows = []
-for ph, g in df2.groupby("phase"):
-    phase_corr= g[corr_cols].corr(method="spearman")
-    phase_rows.append({
-        "phase":ph,
-        "n_steps": len(g),
-        "rho_PE_LU": phase_corr.loc["mean_prediction_error", "local_uncertainty"],
-        "rho_PE_FI": phase_corr.loc["mean_prediction_error", "frontier_ignorance"],
-        "rho_LU_FI": phase_corr.loc["local_uncertainty", "frontier_ignorance"],
-        "rho_PE_move": phase_corr.loc["mean_prediction_error", "is_move"]
-    })
-
-phase_corr_df = pd.DataFrame(phase_rows).sort_values("phase")
-print(phase_corr_df)
-
-
-# ------------- PE VARIANCE v Movement --------------
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# --- 0) Basic flags ---
-df["is_idle"] = (df["action"] == "idle")
-df["is_move"] = ~df["is_idle"]
-
-pe_col = "mean_prediction_error"   # your per-step PE column name
-
-# Safety: drop rows where PE is missing
-df_pe = df.dropna(subset=[pe_col]).copy()
-
-# --- 1) Global variance / std (move vs idle) ---
-global_stats = (
-    df_pe.groupby("is_move")[pe_col]
-    .agg(n="size", mean="mean", var="var", std="std", median="median")
-)
-global_stats.index = global_stats.index.map({True: "move", False: "idle"})
-global_stats.to_csv(f"logs/pe_variance_global_move_vs_idle_{ts}.csv")
-print("\nSaved: pe_variance_global_move_vs_idle.csv")
-
-# --- 2) Per-episode variance (move vs idle) ---
-ep_stats = (
-    df_pe.groupby(["episode", "is_move"])[pe_col]
-    .agg(n="size", mean="mean", var="var", std="std", median="median")
-    .reset_index()
-)
-ep_stats["state"] = ep_stats["is_move"].map({True: "move", False: "idle"})
-ep_stats.to_csv(f"logs/pe_variance_per_episode_move_vs_idle_{ts}.csv", index=False)
-print("Saved: pe_variance_per_episode_move_vs_idle.csv")
-
-# Pivot for plotting
-ep_var = ep_stats.pivot(index="episode", columns="state", values="var")
-ep_std = ep_stats.pivot(index="episode", columns="state", values="std")
-
-# --- 3) Plot: per-episode PE variance for move vs idle ---
-plt.figure()
-ep_var.plot(kind="line")
-plt.title("Per-episode PE variance: move vs idle")
-plt.xlabel("Episode")
-plt.ylabel("Var(PE)")
+# -------------------------------------------------------
+# FIGURE SET 3: Spearman correlations per episode — one figure per seed
+# -------------------------------------------------------
+spearman_metrics = [
+    ("rho_PE_LU", "PE ↔ LU", "#1f77b4"),
+    ("rho_PE_FI", "PE ↔ FI", "#ff7f0e"),
+    ("rho_LU_FI", "LU ↔ FI", "#2ca02c"),
+    ("rho_PE_move", "PE ↔ Move", "#d62728"),
+]
+ 
+for seed in SEEDS:
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle(f"CuriousMan — Spearman Correlations Per Episode (Seed {seed})",
+                 fontsize=13, fontweight="bold")
+    axes_flat = axes.flatten()
+ 
+    for ax_i, (metric, label, color) in enumerate(spearman_metrics):
+        ax = axes_flat[ax_i]
+        for condition in CONDITIONS:
+            lbl = f"{condition}_s{seed}"
+            if lbl not in dfs:
+                continue
+            # load per-episode spearman for this condition+seed
+            # we need to recompute per-seed spearman since we only saved combined
+            df = dfs[lbl].copy()
+            for col in ["mean_prediction_error", "local_uncertainty",
+                        "frontier_ignorance"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df["is_idle"] = df["action"] == "idle"
+            df["is_move"] = (~df["is_idle"]).astype(int)
+            df2 = df.dropna(subset=["mean_prediction_error",
+                                     "local_uncertainty",
+                                     "frontier_ignorance"]).copy()
+            mask_zero = (
+                (df2["mean_prediction_error"] == 0) &
+                (df2["local_uncertainty"] == 0) &
+                (df2["frontier_ignorance"] == 0)
+            )
+            df2 = df2.loc[~mask_zero].copy()
+ 
+            col_map = {
+                "rho_PE_LU":   ("mean_prediction_error", "local_uncertainty"),
+                "rho_PE_FI":   ("mean_prediction_error", "frontier_ignorance"),
+                "rho_LU_FI":   ("local_uncertainty", "frontier_ignorance"),
+                "rho_PE_move": ("mean_prediction_error", "is_move"),
+            }
+            a, b = col_map[metric]
+ 
+            rows = []
+            for ep_n, g in df2.groupby("episode"):
+                rows.append({
+                    "episode": ep_n,
+                    "rho": spearman_pair(g, a, b)
+                })
+            per_ep = pd.DataFrame(rows).dropna()
+ 
+            cond_color = CONDITION_COLORS.get(condition, "gray")
+            ax.plot(per_ep["episode"], per_ep["rho"],
+                    color=cond_color, linewidth=2,
+                    label=condition)
+ 
+        ax.axhline(0, color="black", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.set_title(label, fontsize=11)
+        ax.set_xlabel("Episode")
+        ax.set_ylabel("Spearman ρ")
+        ax.set_ylim(-1.1, 1.1)
+        ax.legend(fontsize=8)
+ 
+    plt.tight_layout()
+    fname = f"logs/panel_spearman_seed{seed}_{ts}.png"
+    fig.savefig(fname, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {fname}")
+ 
+# -------------------------------------------------------
+# FIGURE SET 4: Global Spearman heatmaps — one per condition
+# -------------------------------------------------------
+fig, axes = plt.subplots(1, 4, figsize=(18, 5))
+fig.suptitle("CuriousMan — Global Spearman Correlation Matrices",
+             fontsize=13, fontweight="bold")
+ 
+short_labels = ["PE", "LU", "FI", "Move"]
+ 
+for ax_i, condition in enumerate(CONDITIONS):
+    ax = axes[ax_i]
+    cdfs = [df for k, df in dfs.items() if get_condition(k) == condition]
+    if not cdfs:
+        ax.set_visible(False)
+        continue
+    combined = pd.concat(cdfs).copy()
+    for col in ["mean_prediction_error", "local_uncertainty", "frontier_ignorance"]:
+        combined[col] = pd.to_numeric(combined[col], errors="coerce")
+    combined["is_idle"] = combined["action"] == "idle"
+    combined["is_move"] = (~combined["is_idle"]).astype(int)
+    df2 = combined.dropna(subset=["mean_prediction_error",
+                                   "local_uncertainty",
+                                   "frontier_ignorance"]).copy()
+    mask_zero = (
+        (df2["mean_prediction_error"] == 0) &
+        (df2["local_uncertainty"] == 0) &
+        (df2["frontier_ignorance"] == 0)
+    )
+    df2 = df2.loc[~mask_zero].copy()
+    corr = df2[corr_cols].corr(method="spearman").values
+ 
+    im = ax.imshow(corr, vmin=-1, vmax=1, cmap="RdBu_r", aspect="auto")
+    ax.set_xticks(range(4))
+    ax.set_yticks(range(4))
+    ax.set_xticklabels(short_labels, fontsize=9)
+    ax.set_yticklabels(short_labels, fontsize=9)
+    ax.set_title(condition, fontsize=10, fontweight="bold")
+ 
+    for i in range(4):
+        for j in range(4):
+            ax.text(j, i, f"{corr[i,j]:.2f}",
+                    ha="center", va="center", fontsize=8,
+                    color="white" if abs(corr[i,j]) > 0.6 else "black")
+ 
+plt.colorbar(im, ax=axes[-1], fraction=0.046, pad=0.04, label="Spearman ρ")
 plt.tight_layout()
-plt.savefig(f"logs/pe_variance_per_episode_move_vs_idle_{ts}.png", dpi=200)
-plt.close()
-print("Saved: pe_variance_per_episode_move_vs_idle.png")
+fname = f"logs/panel_spearman_heatmaps_{ts}.png"
+fig.savefig(fname, dpi=200, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved: {fname}")
 
-# --- 4) Rolling variance (captures bursts/spikes) ---
-# Choose a window that matches your intuition about "short-term dynamics"
-ROLL_W = 200
-df_pe["pe_var_roll"] = df_pe[pe_col].rolling(ROLL_W, min_periods=ROLL_W).var()
-
-# Compare rolling variance distributions
-roll_move = df_pe.loc[df_pe["is_move"], "pe_var_roll"].dropna()
-roll_idle = df_pe.loc[df_pe["is_idle"], "pe_var_roll"].dropna()
-
-roll_summary = pd.DataFrame({
-    "group": ["move", "idle"],
-    "n": [len(roll_move), len(roll_idle)],
-    "mean": [roll_move.mean(), roll_idle.mean()],
-    "median": [roll_move.median(), roll_idle.median()],
-    "var": [roll_move.var(), roll_idle.var()],
-    "std": [roll_move.std(), roll_idle.std()],
-})
-roll_summary.to_csv(f"logs/pe_rolling_variance_summary_move_vs_idle_{ts}.csv", index=False)
-print("Saved: pe_rolling_variance_summary_move_vs_idle.csv")
-
-# --- 5) Plot: rolling variance (boxplot) ---
-plt.figure()
-plt.boxplot([roll_move.values, roll_idle.values], labels=["move", "idle"], showfliers=False)
-plt.title(f"Rolling PE variance (window={ROLL_W})")
-plt.ylabel("Rolling Var(PE)")
-plt.tight_layout()
-plt.savefig(f"logs/pe_rolling_variance_boxplot_move_vs_idle_{ts}.png", dpi=200)
-plt.close()
-print("Saved: pe_rolling_variance_boxplot_move_vs_idle.png")
+print(f"\nAll plots and CSVs saved to logs/ with timestamp: {ts}")

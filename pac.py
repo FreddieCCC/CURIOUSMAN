@@ -20,7 +20,7 @@ class Pac(pygame.sprite.Sprite):
         self.directions = {'left': (-PLAYER_SPEED, 0), 'right': (PLAYER_SPEED, 0), 'up': (0, -PLAYER_SPEED), 'down': (0, PLAYER_SPEED), 'idle': (0,0)}
         self.keys = {'left': pygame.K_LEFT, 'right': pygame.K_RIGHT, 'up': pygame.K_UP, 'down': pygame.K_DOWN}
         self.direction = (0, 0)
-        self.radius = 2 # 5x5 grid area
+        self.radius = 3 # 7x7 grid area
         # pac status
         self.status = "idle"
 

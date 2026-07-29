@@ -27,9 +27,9 @@ class World:
         self.reset_pos = False
         self.episode = 1
         self.steps_in_episode = 0
-        self.max_episodes = 21                                               #likely for fulfilling experimental goals
-        self.max_steps_per_episode = 10000
-        self.episode_lenghts =[]
+        self.max_episodes = 20                                               #likely for fulfilling experimental goals
+        self.max_steps_per_episode = 20000
+        self.episode_lengths =[]
         self.H = len(MAP)
         self.W = len(MAP[0])
         self.p_wall = [[0.5 for _ in range(self.H)] for _ in range(self.W)] #agent's belief that there is a wall in that tile//0.5 as prior
@@ -80,9 +80,9 @@ class World:
     def update(self):
         if not self.game_over:
             # player movement
-            new_tiles, mean_pe =self.update_belief() # update agent's beliefs based on observation; mean predictive error
             action, best_score, chosen_score = self.choose_action() # choose action based on current beliefs
             attempted, collided,target_tile = self.player.sprite.step(action,self.walls_collide_list) # execute action (by itself)
+            new_tiles, mean_pe =self.update_belief() # update agent's beliefs based on observation; mean predictive error
             x,y = self.player.sprite.get_pos()
             lu = self.local_uncertainty()
             fi = self.frontier_ignorance()
@@ -111,14 +111,13 @@ class World:
                 tx,ty=target_tile
                 if 0<=tx<self.W and 0<=ty<self.H:
                     o = 1 if collided else 0
-                    p=float(self.p_wall[x][y])
+                    p=float(self.p_wall[tx][ty])
                     updated=p+ self.wall_rate*(o-p)
                     self.p_wall[tx][ty]=min(1,max(0,updated))
             self.steps_in_episode += 1
             if self.steps_in_episode >= self.max_steps_per_episode:
-                self.episode_lenghts.append(self.steps_in_episode)
+                self.episode_lengths.append(self.steps_in_episode)
                 self.episode += 1
-                self.epistemic_weight = max(self.epistemic_weight_min, self.epistemic_weight*self.epistemic_decay)
                 self.steps_in_episode = 0
                 self.reset_episode()
             # teleporting to the other side of the map
@@ -129,10 +128,9 @@ class World:
             # PacMan bumping into ghosts
             for ghost in self.ghosts.sprites():
                 if self.player.sprite.rect.colliderect(ghost.rect):
-                        self.episode_lenghts.append(self.steps_in_episode)
+                        self.episode_lengths.append(self.steps_in_episode)
                         self.ghost_certainty = self.ghost_certainty + self.ghost_rate * (1 - self.ghost_certainty)
                         self.episode += 1
-                        self.epistemic_weight=max(self.epistemic_weight_min, self.epistemic_weight*self.epistemic_decay)
                         if self.episode >= self.max_episodes:
                             self.game_over = True
                             break
@@ -249,30 +247,38 @@ class World:
         r =pac.radius
 
         #epistemic value from predictive beliefs: expected uncertainty in the next observation window
-        epistemic = self.expected_uncertainty(nx,ny,r)
-
+        epistemic = self.expected_uncertainty(nx,ny,r * 2) #inostensible references
+        sf = self.seen_fraction()
+        seen_decay = self.epistemic_decay * sf
+        weight = max(self.epistemic_weight_min, self.epistemic_weight * (1 - seen_decay))  # decay epistemic weight as more of the map is seen
         #adjust gain based on ghost certainty
-
+        ghost_term = 0
         ignorance, visible, ghost_pos = self.ghost_ignorance()
         if visible and ghost_pos is not None and self.ghost_certainty < self.ghost_follow_thresh:
             gx,gy =ghost_pos
             d=abs(gx - nx) + abs(gy - ny)
             proximity = 1/(d+1)
-            return self.ghost_follow_weight*proximity 
-        return self.epistemic_weight*epistemic
+            ghost_term = self.ghost_follow_weight * proximity
+            return (weight * epistemic) + ghost_term #Trade-off between epistemic exploration and ghost-following behavior
+        return weight*epistemic
 
-    def choose_action(self):
-        actions = ["left","right","up","down","idle"]
-        scored = []
-        for action in actions:
-            score=self.action_score(action)
-            scored.append((score,action))
+    def choose_action(self, temperature = 0.1):
+        actions = ["left", "right", "up", "down", "idle"]
+        scored = [(self.action_score(a), a) for a in actions]
 
-        best_score = max(score for score,_ in scored)
-        best_actions = [action for score,action in scored if score == best_score]
-        chosen_action = random.choice(best_actions)
-        return chosen_action, best_score, best_score
-    
+        scores = [s for s, _ in scored]
+        max_score = max(scores)
+        exp_scores = [math.exp((s - max_score) / temperature) for s in scores]
+        total = sum(exp_scores)
+        probs = [e / total for e in exp_scores]
+
+        chosen_action = random.choices(
+            [a for _, a in scored], weights=probs, k=1
+        )[0]
+        score_map = {a: s for s, a in scored}
+        chosen_score = score_map[chosen_action]
+        return chosen_action, max_score, chosen_score
+        
     def frontier_ignorance(self):
         pac=self.player.sprite
         px,py=pac.get_pos()
